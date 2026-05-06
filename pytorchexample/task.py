@@ -1,5 +1,6 @@
 """pytorchexample: aplicación Flower / PyTorch para detección de matrículas."""
 
+import copy
 import os
 import tempfile
 
@@ -8,6 +9,7 @@ from datasets import load_dataset
 from PIL import Image
 from ultralytics import YOLO
 from ultralytics.nn.tasks import DetectionModel
+from pathlib import Path
 
 # Nombre del dataset en HuggingFace y la única clase que queremos detectar
 DATASET_NAME = "keremberke/license-plate-object-detection"
@@ -18,8 +20,10 @@ _full_train = None
 
 
 def get_model() -> YOLO:
-    base = YOLO("custom_yolov8.yaml")
-    return base
+    model_yaml = Path(__file__).resolve().parents[1] / "custom_yolov8.yaml"
+    return YOLO(str(model_yaml))
+    #base = YOLO("custom_yolov8.yaml")
+    #return base
 
 def _save_examples_to_yolo(examples, output_dir: str) -> None:
     """Convierte los ejemplos del dataset al formato que espera YOLO y los guarda en disco.
@@ -127,27 +131,49 @@ def _yolo_device(device: torch.device) -> int | str:
     return "cpu"
 
 
+def _yolo_with_weights(net: YOLO) -> YOLO:
+    """Guarda los pesos actuales en un .pt temporal y recarga YOLO desde él.
+
+    YOLO solo preserva los pesos cargados durante .train() si el modelo fue
+    inicializado desde un checkpoint .pt (self.ckpt != None). Si se cargó
+    desde un YAML, reinicializa desde cero ignorando cualquier load_state_dict().
+    Guardarlo en .pt temporal y recargarlo fuerza self.ckpt != None.
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
+    tmp.close()
+    try:
+        torch.save({"model": copy.deepcopy(net.model).half(), "epoch": 0}, tmp.name)
+        return YOLO(tmp.name)
+    finally:
+        os.unlink(tmp.name)
+
+
 def train(net: YOLO, data_yaml: str, epochs: int, lr: float, device: torch.device) -> float:
     """Entrena el modelo YOLOv8n con los datos locales del cliente durante un número de épocas.
 
     Devuelve la pérdida de las bounding boxes al final del entrenamiento.
     """
-    # Guardamos los resultados del entrenamiento junto al data.yaml
     base_dir = os.path.dirname(data_yaml)
+    # Recargamos desde .pt para que YOLO no descarte los pesos del servidor al entrenar
+    net = _yolo_with_weights(net)
     results = net.train(
         data=data_yaml,
         epochs=epochs,
-        lr0=lr,           # tasa de aprendizaje inicial
+        lr0=lr,
         device=_yolo_device(device),
-        verbose=False,    # silenciamos la salida para no ensuciar los logs de Flower
-        plots=False,      # no generamos gráficas durante el entrenamiento federado
+        verbose=False,
+        plots=False,
         project=os.path.join(base_dir, "runs"),
         name="train",
-        exist_ok=True,    # si ya existe la carpeta, la sobreescribimos
+        exist_ok=True,
     )
-    # Extraemos la box_loss del último epoch para reportarla al servidor
     try:
-        box_loss = float(results.results_dict.get("train/box_loss", 0.0))
+        # La clave correcta en ultralytics es "train/box_loss" o "metrics/box_loss"
+        # dependiendo de la versión; probamos ambas
+        rd = results.results_dict
+        box_loss = float(
+            rd.get("train/box_loss") or rd.get("metrics/box_loss") or 0.0
+        )
     except (AttributeError, TypeError):
         box_loss = 0.0
     return box_loss

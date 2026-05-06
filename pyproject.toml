@@ -10,7 +10,7 @@ license = {file = "LICENSE"}
 dependencies = [
     "flwr[simulation]>=1.28.0",
     "flwr-datasets[vision]>=0.6.0",
-    "torch==2.8.0",
+    "torch==2.9.0",
     "torchvision==0.23.0",
     "ultralytics>=8.0.0",
     "datasets>=2.14.0,<3.0.0",
