@@ -16,14 +16,19 @@ DATASET_NAME = "keremberke/license-plate-object-detection"
 CLASS_NAMES = ["license_plate"]
 
 # Guardamos el split de entrenamiento en memoria para no descargarlo varias veces
-_full_train = None
-
+FULL_TRAIN = None
 
 def get_model() -> YOLO:
-    model_yaml = Path(__file__).resolve().parents[1] / "custom_yolov8.yaml"
-    return YOLO(str(model_yaml))
-    #base = YOLO("custom_yolov8.yaml")
-    #return base
+    root = Path(__file__).resolve().parents[1]
+    model_yaml = root / "custom_yolov8.yaml"
+    weights = root / "yolo26n.pt"
+
+    model = YOLO(str(model_yaml))
+
+    if weights.exists():
+        model.load(str(weights))
+
+    return model
 
 def _save_examples_to_yolo(examples, output_dir: str) -> None:
     """Convierte los ejemplos del dataset al formato que espera YOLO y los guarda en disco.
@@ -77,18 +82,18 @@ def load_data(partition_id: int, num_partitions: int) -> tuple[str, int, int]:
 
     Devuelve la ruta al data.yaml, el número de ejemplos de entrenamiento y de validación.
     """
-    global _full_train
+    global FULL_TRAIN
     # Solo descargamos el dataset completo la primera vez
-    if _full_train is None:
-        _full_train = load_dataset(
+    if FULL_TRAIN is None:
+        FULL_TRAIN = load_dataset(
             DATASET_NAME, name="full", split="train", trust_remote_code=True
         ).shuffle(seed=42)  # barajamos para que la partición sea aleatoria pero reproducible
 
     # Dividimos el dataset en franjas iguales, una por cliente (partición IID)
-    n = len(_full_train)
+    n = len(FULL_TRAIN)
     start = (partition_id * n) // num_partitions
     end = ((partition_id + 1) * n) // num_partitions
-    partition = _full_train.select(range(start, end))
+    partition = FULL_TRAIN.select(range(start, end))
 
     # Dentro de la partición de cada cliente, separamos 80% train y 20% validación local
     splits = partition.train_test_split(test_size=0.2, seed=42)
