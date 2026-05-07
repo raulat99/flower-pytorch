@@ -27,7 +27,7 @@ def train(msg: Message, context: Context):
     data_yaml, num_train, _ = load_data(partition_id, num_partitions)
 
     # Entrenamos el modelo con los datos locales
-    train_loss = train_fn(
+    model, train_loss = train_fn(
         model,
         data_yaml,
         context.run_config["local-epochs"],

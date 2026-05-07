@@ -148,10 +148,10 @@ def _yolo_with_weights(net: YOLO) -> YOLO:
         os.unlink(tmp.name)
 
 
-def train(net: YOLO, data_yaml: str, epochs: int, lr: float, device: torch.device) -> float:
+def train(net: YOLO, data_yaml: str, epochs: int, lr: float, device: torch.device) -> tuple["YOLO", float]:
     """Entrena el modelo YOLOv8n con los datos locales del cliente durante un número de épocas.
 
-    Devuelve la pérdida de las bounding boxes al final del entrenamiento.
+    Devuelve el modelo entrenado y la pérdida de las bounding boxes al final del entrenamiento.
     """
     base_dir = os.path.dirname(data_yaml)
     # Recargamos desde .pt para que YOLO no descarte los pesos del servidor al entrenar
@@ -163,6 +163,8 @@ def train(net: YOLO, data_yaml: str, epochs: int, lr: float, device: torch.devic
         device=_yolo_device(device),
         verbose=False,
         plots=False,
+        workers=0,
+        cache=False,
         project=os.path.join(base_dir, "runs"),
         name="train",
         exist_ok=True,
@@ -176,7 +178,7 @@ def train(net: YOLO, data_yaml: str, epochs: int, lr: float, device: torch.devic
         )
     except (AttributeError, TypeError):
         box_loss = 0.0
-    return box_loss
+    return net, box_loss
 
 
 def test(net: YOLO, data_yaml: str, device: torch.device) -> tuple[float, float]:
