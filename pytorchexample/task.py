@@ -1,166 +1,515 @@
-"""pytorchexample: aplicación Flower / PyTorch para detección de matrículas."""
+"""pytorchexample: aplicación Flower / PyTorch para detección federada de matrículas."""
 
 import copy
 import os
+import shutil
 import tempfile
+from pathlib import Path
+from typing import Any
 
 import torch
 from datasets import load_dataset
 from PIL import Image
 from ultralytics import YOLO
-from ultralytics.nn.tasks import DetectionModel
-from pathlib import Path
 
-# Nombre del dataset en HuggingFace y la única clase que queremos detectar
+# Nombre del dataset en HuggingFace y única clase que queremos detectar
 DATASET_NAME = "keremberke/license-plate-object-detection"
 CLASS_NAMES = ["license_plate"]
 
 # Guardamos el split de entrenamiento en memoria para no descargarlo varias veces
 FULL_TRAIN = None
 
+# Evita imprimir las mismas estadísticas de dataset demasiadas veces
+_PRINTED_DATASET_STATS: set[str] = set()
+
+
 def get_model() -> YOLO:
-    root = Path(__file__).resolve().parents[1]
-    model_yaml = root / "custom_yolov8.yaml"
-    weights = root / "yolo26n.pt"
+    """Crea el modelo YOLO de una clase y carga pesos iniciales si están disponibles.
+
+    El modelo se construye desde custom_yolov8.yaml para mantener nc=1.
+    Después se intenta cargar yolo26n.pt como pesos iniciales compatibles.
+    """
+    _here = Path(__file__).resolve().parent
+    model_yaml = _here / "custom_yolov8.yaml"
+    weights = _here / "yolo26n.pt"
 
     model = YOLO(str(model_yaml))
 
     if weights.exists():
-        model.load(str(weights))
+        try:
+            model.load(str(weights))
+            print(f"[MODEL] Pesos iniciales cargados desde: {weights}")
+        except Exception as exc:
+            print(
+                "[MODEL] WARNING: no se pudieron cargar los pesos "
+                f"desde {weights}. Se usará el modelo inicializado desde YAML.\n"
+                f"[MODEL] Motivo: {exc}"
+            )
+    else:
+        try:
+            print("[MODEL] Descargando pesos yolov8n.pt desde ultralytics...")
+            tmp = YOLO("yolov8n.pt")  # ultralytics lo descarga automáticamente
+            model.load(str(tmp.ckpt_path))
+            print("[MODEL] Pesos yolov8n.pt cargados correctamente.")
+        except Exception as exc:
+            print(
+                f"[MODEL] WARNING: no se pudieron descargar pesos. "
+                "Se usará el modelo inicializado desde YAML.\n"
+                f"[MODEL] Motivo: {exc}"
+            )
 
     return model
 
-def _save_examples_to_yolo(examples, output_dir: str) -> None:
-    """Convierte los ejemplos del dataset al formato que espera YOLO y los guarda en disco.
 
-    El dataset viene en formato COCO: las bounding boxes son [x_min, y_min, w, h]
-    en píxeles absolutos. YOLO necesita [clase x_centro y_centro ancho alto]
-    con valores normalizados entre 0 y 1 respecto al tamaño de la imagen.
+def _extract_bboxes(example: dict[str, Any]) -> list[list[float]]:
+    """Extrae bounding boxes del ejemplo de HuggingFace.
+
+    El dataset está en formato COCO: [x_min, y_min, width, height].
+    Esta función es algo más robusta por si la estructura exacta cambia.
     """
-    # Creamos las carpetas de imágenes y etiquetas si no existen
+    bboxes = []
+
+    objects = example.get("objects", {})
+
+    if isinstance(objects, dict):
+        for key in ("bbox", "bboxes", "boxes"):
+            if key in objects and objects[key] is not None:
+                bboxes = objects[key]
+                break
+
+    elif isinstance(objects, list):
+        extracted = []
+        for obj in objects:
+            if isinstance(obj, dict):
+                bbox = obj.get("bbox") or obj.get("box") or obj.get("bboxes")
+                if bbox is not None:
+                    extracted.append(bbox)
+        bboxes = extracted
+
+    if not bboxes:
+        for key in ("bbox", "bboxes", "boxes"):
+            if key in example and example[key] is not None:
+                bboxes = example[key]
+                break
+
+    clean_bboxes: list[list[float]] = []
+
+    for bbox in bboxes:
+        if bbox is None:
+            continue
+
+        if isinstance(bbox, dict):
+            bbox = bbox.get("bbox") or bbox.get("box")
+
+        try:
+            coords = list(bbox)
+        except TypeError:
+            continue
+
+        if len(coords) < 4:
+            continue
+
+        try:
+            x_min = float(coords[0])
+            y_min = float(coords[1])
+            width = float(coords[2])
+            height = float(coords[3])
+        except (TypeError, ValueError):
+            continue
+
+        clean_bboxes.append([x_min, y_min, width, height])
+
+    return clean_bboxes
+
+
+def _clear_yolo_output_dir(output_dir: str) -> None:
+    """Elimina un split YOLO temporal para regenerarlo limpio."""
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+
+
+def _save_examples_to_yolo(examples, output_dir: str) -> None:
+    """Convierte ejemplos COCO/HuggingFace a formato YOLO.
+
+    YOLO espera una estructura como:
+
+        output_dir/
+            images/
+                000000.jpg
+            labels/
+                000000.txt
+
+    Cada línea del .txt tiene el formato:
+
+        class x_center y_center width height
+
+    con coordenadas normalizadas entre 0 y 1.
+    """
     img_dir = os.path.join(output_dir, "images")
     lbl_dir = os.path.join(output_dir, "labels")
+
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(lbl_dir, exist_ok=True)
 
+    total_images = 0
+    total_boxes = 0
+    images_without_boxes = 0
+
     for idx, example in enumerate(examples):
         img = example["image"]
+
         if not isinstance(img, Image.Image):
             img = Image.fromarray(img)
+
         img = img.convert("RGB")
-        w, h = img.size
+        img_w, img_h = img.size
 
-        # Guardamos la imagen en disco
-        img.save(os.path.join(img_dir, f"{idx:06d}.jpg"))
+        image_name = f"{idx:06d}.jpg"
+        label_name = f"{idx:06d}.txt"
 
-        # Escribimos el archivo de etiquetas con las bounding boxes convertidas
-        with open(os.path.join(lbl_dir, f"{idx:06d}.txt"), "w") as f:
-            objects = example["objects"]
-            for bbox in objects.get("bbox", []):
-                x_min, y_min, bw, bh = bbox
-                # Conversión de COCO a YOLO: centro normalizado y tamaño normalizado
-                x_c = (x_min + bw / 2) / w
-                y_c = (y_min + bh / 2) / h
-                # Clase 0 porque solo tenemos una clase (license_plate)
-                f.write(f"0 {x_c:.6f} {y_c:.6f} {bw / w:.6f} {bh / h:.6f}\n")
+        img_path = os.path.join(img_dir, image_name)
+        lbl_path = os.path.join(lbl_dir, label_name)
+
+        img.save(img_path)
+
+        bboxes = _extract_bboxes(example)
+
+        valid_boxes_for_image = 0
+
+        with open(lbl_path, "w", encoding="utf-8") as f:
+            for bbox in bboxes:
+                x_min, y_min, box_w, box_h = bbox
+
+                # Ignoramos cajas inválidas
+                if img_w <= 0 or img_h <= 0:
+                    continue
+                if box_w <= 0 or box_h <= 0:
+                    continue
+
+                # Conversión COCO -> YOLO
+                x_center = (x_min + box_w / 2.0) / img_w
+                y_center = (y_min + box_h / 2.0) / img_h
+                box_w_norm = box_w / img_w
+                box_h_norm = box_h / img_h
+
+                # Clampeamos por seguridad al rango [0, 1]
+                x_center = max(0.0, min(1.0, x_center))
+                y_center = max(0.0, min(1.0, y_center))
+                box_w_norm = max(0.0, min(1.0, box_w_norm))
+                box_h_norm = max(0.0, min(1.0, box_h_norm))
+
+                # Si tras normalizar queda una caja degenerada, la ignoramos
+                if box_w_norm <= 0.0 or box_h_norm <= 0.0:
+                    continue
+
+                # Clase 0 porque solo tenemos license_plate
+                f.write(
+                    f"0 {x_center:.6f} {y_center:.6f} "
+                    f"{box_w_norm:.6f} {box_h_norm:.6f}\n"
+                )
+
+                valid_boxes_for_image += 1
+                total_boxes += 1
+
+        if valid_boxes_for_image == 0:
+            images_without_boxes += 1
+
+        total_images += 1
+
+    print(f"[DATASET] Guardadas {total_images} imágenes en {output_dir}")
+    print(f"[DATASET] Guardadas {total_boxes} bounding boxes en formato YOLO")
+    print(f"[DATASET] Imágenes sin cajas: {images_without_boxes}")
+
+
+def _count_files(folder: str, suffixes: tuple[str, ...]) -> int:
+    if not os.path.exists(folder):
+        return 0
+
+    count = 0
+    for filename in os.listdir(folder):
+        if filename.lower().endswith(suffixes):
+            count += 1
+
+    return count
+
+
+def _dataset_stats(output_dir: str) -> dict[str, int]:
+    """Devuelve estadísticas básicas de un split YOLO."""
+    img_dir = os.path.join(output_dir, "images")
+    lbl_dir = os.path.join(output_dir, "labels")
+
+    num_images = _count_files(img_dir, (".jpg", ".jpeg", ".png"))
+    num_labels = _count_files(lbl_dir, (".txt",))
+
+    non_empty_labels = 0
+    total_boxes = 0
+
+    if os.path.exists(lbl_dir):
+        for filename in os.listdir(lbl_dir):
+            if not filename.lower().endswith(".txt"):
+                continue
+
+            path = os.path.join(lbl_dir, filename)
+
+            if os.path.getsize(path) > 0:
+                non_empty_labels += 1
+
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f.readlines() if line.strip()]
+                total_boxes += len(lines)
+
+    return {
+        "images": num_images,
+        "labels": num_labels,
+        "non_empty_labels": non_empty_labels,
+        "boxes": total_boxes,
+    }
+
+
+def _has_valid_yolo_dataset(output_dir: str) -> bool:
+    """Comprueba que el split YOLO tiene imágenes y etiquetas útiles."""
+    stats = _dataset_stats(output_dir)
+
+    if stats["images"] <= 0:
+        return False
+
+    # Queremos un .txt por imagen. Aunque alguna imagen no tenga caja,
+    # debe existir su .txt vacío para mantener el dataset consistente.
+    if stats["labels"] != stats["images"]:
+        return False
+
+    # Para este dataset de matrículas, debe haber al menos una caja.
+    # Si boxes=0, Ultralytics mostrará "no labels found".
+    if stats["boxes"] <= 0:
+        return False
+
+    return True
+
+
+def _print_dataset_stats_once(split_name: str, output_dir: str) -> None:
+    key = f"{split_name}:{output_dir}"
+
+    if key in _PRINTED_DATASET_STATS:
+        return
+
+    stats = _dataset_stats(output_dir)
+
+    print(
+        f"[DATASET] {split_name}: "
+        f"{stats['images']} imágenes, "
+        f"{stats['labels']} ficheros .txt, "
+        f"{stats['non_empty_labels']} labels no vacías, "
+        f"{stats['boxes']} cajas"
+    )
+
+    _PRINTED_DATASET_STATS.add(key)
+
+
+def _ensure_yolo_dataset(examples, output_dir: str, split_name: str) -> None:
+    """Asegura que el split existe y contiene labels válidas.
+
+    Si existe images/ pero no labels/, o si las labels están vacías,
+    se borra y se regenera el split entero.
+    """
+    if not _has_valid_yolo_dataset(output_dir):
+        print(f"[DATASET] Regenerando split '{split_name}' en: {output_dir}")
+        _clear_yolo_output_dir(output_dir)
+        _save_examples_to_yolo(examples, output_dir)
+
+    stats = _dataset_stats(output_dir)
+
+    print(
+        f"[DATASET] {split_name}: "
+        f"{stats['images']} imágenes, "
+        f"{stats['labels']} ficheros .txt, "
+        f"{stats['non_empty_labels']} labels no vacías, "
+        f"{stats['boxes']} cajas"
+    )
+
+    if stats["images"] <= 0:
+        raise RuntimeError(
+            f"No se han generado imágenes para el split '{split_name}'. "
+            f"Ruta: {output_dir}"
+        )
+
+    if stats["labels"] != stats["images"]:
+        raise RuntimeError(
+            f"Dataset YOLO inconsistente en '{split_name}': "
+            f"{stats['images']} imágenes pero {stats['labels']} labels. "
+            f"Ruta: {output_dir}"
+        )
+
+    if stats["boxes"] <= 0:
+        raise RuntimeError(
+            f"No se han generado bounding boxes válidas para '{split_name}'. "
+            "Ultralytics no podrá calcular mAP. "
+            "Revisa la extracción de 'objects/bbox' del dataset."
+        )
 
 
 def _write_data_yaml(base_dir: str, train_rel: str, val_rel: str) -> str:
-    """Genera el fichero data.yaml que necesita YOLO para encontrar los datos."""
+    """Genera el fichero data.yaml que necesita YOLO."""
     yaml_path = os.path.join(base_dir, "data.yaml")
-    with open(yaml_path, "w") as f:
-        f.write(f"path: {base_dir}\n")   # carpeta raíz del dataset
-        f.write(f"train: {train_rel}\n")  # ruta relativa a las imágenes de entrenamiento
-        f.write(f"val: {val_rel}\n")      # ruta relativa a las imágenes de validación
-        f.write("nc: 1\n")               # número de clases
-        f.write(f"names: {CLASS_NAMES}\n") # nombres de las clases
+
+    # En Windows es más seguro escribir rutas con /
+    base_path = Path(base_dir).resolve().as_posix()
+
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        f.write(f"path: {base_path}\n")
+        f.write(f"train: {train_rel}\n")
+        f.write(f"val: {val_rel}\n")
+        f.write("nc: 1\n")
+        f.write(f"names: {CLASS_NAMES}\n")
+
+    print(f"[DATASET] data.yaml generado en: {yaml_path}")
     return yaml_path
 
 
 def load_data(partition_id: int, num_partitions: int) -> tuple[str, int, int]:
-    """Carga y prepara la partición de datos correspondiente a este cliente federado.
+    """Carga y prepara la partición de datos correspondiente a un cliente federado.
 
-    Devuelve la ruta al data.yaml, el número de ejemplos de entrenamiento y de validación.
+    Devuelve:
+        - ruta al data.yaml
+        - número de ejemplos de entrenamiento
+        - número de ejemplos de validación local
     """
     global FULL_TRAIN
-    # Solo descargamos el dataset completo la primera vez
-    if FULL_TRAIN is None:
-        FULL_TRAIN = load_dataset(
-            DATASET_NAME, name="full", split="train", trust_remote_code=True
-        ).shuffle(seed=42)  # barajamos para que la partición sea aleatoria pero reproducible
 
-    # Dividimos el dataset en franjas iguales, una por cliente (partición IID)
+    if FULL_TRAIN is None:
+        print("[DATASET] Cargando split train desde HuggingFace...")
+        FULL_TRAIN = load_dataset(
+            DATASET_NAME,
+            name="full",
+            split="train",
+            trust_remote_code=True,
+        ).shuffle(seed=42)
+
     n = len(FULL_TRAIN)
+
     start = (partition_id * n) // num_partitions
     end = ((partition_id + 1) * n) // num_partitions
-    partition = FULL_TRAIN.select(range(start, end))
 
-    # Dentro de la partición de cada cliente, separamos 80% train y 20% validación local
+    partition = FULL_TRAIN.select(range(start, end))
     splits = partition.train_test_split(test_size=0.2, seed=42)
 
-    # Usamos una carpeta temporal distinta para cada cliente
     base_dir = os.path.join(
-        tempfile.gettempdir(), f"lp_yolo_partition_{partition_id}"
+        tempfile.gettempdir(),
+        f"lp_yolo_partition_{partition_id}",
     )
+
     train_dir = os.path.join(base_dir, "train")
     val_dir = os.path.join(base_dir, "val")
 
-    # Solo escribimos en disco si no lo hemos hecho antes (para ahorrar tiempo)
-    if not os.path.exists(os.path.join(train_dir, "images")):
-        _save_examples_to_yolo(splits["train"], train_dir)
-    if not os.path.exists(os.path.join(val_dir, "images")):
-        _save_examples_to_yolo(splits["test"], val_dir)
+    _ensure_yolo_dataset(
+        splits["train"],
+        train_dir,
+        f"cliente_{partition_id}_train",
+    )
+
+    _ensure_yolo_dataset(
+        splits["test"],
+        val_dir,
+        f"cliente_{partition_id}_val",
+    )
 
     yaml_path = _write_data_yaml(base_dir, "train/images", "val/images")
+
     return yaml_path, len(splits["train"]), len(splits["test"])
 
 
 def load_centralized_dataset() -> str:
-    """Prepara el split de validación completo para que el servidor pueda evaluar el modelo global."""
+    """Prepara el split de validación centralizado para evaluar el modelo global."""
     base_dir = os.path.join(tempfile.gettempdir(), "lp_yolo_central")
     val_dir = os.path.join(base_dir, "validation")
 
-    # Solo lo escribimos en disco la primera vez
-    if not os.path.exists(os.path.join(val_dir, "images")):
-        valid_data = load_dataset(DATASET_NAME, name="full", split="validation", trust_remote_code=True)
-        _save_examples_to_yolo(valid_data, val_dir)
+    if not _has_valid_yolo_dataset(val_dir):
+        print("[DATASET] Cargando split validation desde HuggingFace...")
+        valid_data = load_dataset(
+            DATASET_NAME,
+            name="full",
+            split="validation",
+            trust_remote_code=True,
+        )
+
+        _ensure_yolo_dataset(
+            valid_data,
+            val_dir,
+            "servidor_validation",
+        )
+    else:
+        _print_dataset_stats_once("servidor_validation", val_dir)
 
     return _write_data_yaml(base_dir, "validation/images", "validation/images")
 
 
 def _yolo_device(device: torch.device) -> int | str:
-    """Convierte el device de PyTorch al formato que entiende ultralytics (número de GPU o 'cpu')."""
-    s = str(device)
-    if s.startswith("cuda"):
-        return int(s.split(":")[-1]) if ":" in s else 0
+    """Convierte el device PyTorch al formato que entiende Ultralytics."""
+    device_str = str(device)
+
+    if device_str.startswith("cuda"):
+        return int(device_str.split(":")[-1]) if ":" in device_str else 0
+
     return "cpu"
 
 
 def _yolo_with_weights(net: YOLO) -> YOLO:
-    """Guarda los pesos actuales en un .pt temporal y recarga YOLO desde él.
+    """Recarga el modelo desde un .pt temporal para que Ultralytics preserve los pesos.
 
-    YOLO solo preserva los pesos cargados durante .train() si el modelo fue
-    inicializado desde un checkpoint .pt (self.ckpt != None). Si se cargó
-    desde un YAML, reinicializa desde cero ignorando cualquier load_state_dict().
-    Guardarlo en .pt temporal y recargarlo fuerza self.ckpt != None.
+    Si YOLO se inicializa desde YAML, algunas versiones de Ultralytics pueden
+    reinicializar durante .train(). Guardar el modelo actual como .pt temporal
+    y recargarlo evita que se pierdan los pesos globales recibidos desde Flower.
     """
     tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
     tmp.close()
+
     try:
-        torch.save({"model": copy.deepcopy(net.model).half(), "epoch": 0}, tmp.name)
+        model_copy = copy.deepcopy(net.model).cpu().float()
+
+        torch.save(
+            {
+                "model": model_copy,
+                "epoch": 0,
+                "train_args": {},
+            },
+            tmp.name,
+        )
+
         return YOLO(tmp.name)
+
     finally:
-        os.unlink(tmp.name)
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
 
 
-def train(net: YOLO, data_yaml: str, epochs: int, lr: float, device: torch.device) -> tuple["YOLO", float]:
-    """Entrena el modelo YOLOv8n con los datos locales del cliente durante un número de épocas.
+def _get_float_from_dict(data: dict[str, Any], keys: list[str], default: float = 0.0) -> float:
+    """Obtiene un float de un diccionario probando varias claves."""
+    for key in keys:
+        value = data.get(key)
 
-    Devuelve el modelo entrenado y la pérdida de las bounding boxes al final del entrenamiento.
-    """
+        if value is None:
+            continue
+
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+
+    return default
+
+
+def train(
+    net: YOLO,
+    data_yaml: str,
+    epochs: int,
+    lr: float,
+    device: torch.device,
+) -> tuple[YOLO, float]:
+    """Entrena el modelo YOLO con los datos locales del cliente."""
     base_dir = os.path.dirname(data_yaml)
-    # Recargamos desde .pt para que YOLO no descarte los pesos del servidor al entrenar
+
+    # Recargamos desde .pt para que YOLO no descarte los pesos federados
     net = _yolo_with_weights(net)
+
     results = net.train(
         data=data_yaml,
         epochs=epochs,
@@ -174,34 +523,79 @@ def train(net: YOLO, data_yaml: str, epochs: int, lr: float, device: torch.devic
         name="train",
         exist_ok=True,
     )
+
+    train_loss = 0.0
+
     try:
-        # La clave correcta en ultralytics es "train/box_loss" o "metrics/box_loss"
-        # dependiendo de la versión; probamos ambas
-        rd = results.results_dict
-        box_loss = float(
-            rd.get("train/box_loss") or rd.get("metrics/box_loss") or 0.0
+        results_dict = getattr(results, "results_dict", {}) or {}
+
+        # Algunas versiones de Ultralytics no guardan estas pérdidas en results_dict.
+        # Si no existen, devolvemos 0.0 solo como métrica auxiliar de Flower.
+        box_loss = _get_float_from_dict(
+            results_dict,
+            ["train/box_loss", "box_loss", "metrics/box_loss"],
+            0.0,
         )
-    except (AttributeError, TypeError):
-        box_loss = 0.0
-    return net, box_loss
+
+        cls_loss = _get_float_from_dict(
+            results_dict,
+            ["train/cls_loss", "cls_loss", "metrics/cls_loss"],
+            0.0,
+        )
+
+        dfl_loss = _get_float_from_dict(
+            results_dict,
+            ["train/dfl_loss", "dfl_loss", "metrics/dfl_loss"],
+            0.0,
+        )
+
+        train_loss = box_loss + cls_loss + dfl_loss
+
+    except Exception as exc:
+        print(f"[TRAIN] WARNING: no se pudo leer train_loss: {exc}")
+        train_loss = 0.0
+
+    return net, train_loss
 
 
 def test(net: YOLO, data_yaml: str, device: torch.device) -> tuple[float, float]:
-    """Evalúa el modelo sobre un conjunto de datos y devuelve la pérdida y el mAP50.
+    """Evalúa el modelo y devuelve loss aproximada y mAP50."""
+    base_dir = os.path.dirname(data_yaml)
+    run_name = f"val_{Path(base_dir).name}"
 
-    El mAP50 (mean Average Precision al 50% de IoU) es la métrica estándar
-    para medir la calidad de un detector de objetos.
-    """
     metrics = net.val(
         data=data_yaml,
         device=_yolo_device(device),
         verbose=False,
         plots=False,
+        workers=0,
+        project=os.path.join(tempfile.gettempdir(), "lp_yolo_val_runs"),
+        name=run_name,
+        exist_ok=True,
     )
-    # Recogemos las métricas (si algo falla devolvemos ceros para no romper nada)
+
     try:
-        val_loss = float(metrics.results_dict.get("val/box_loss", 0.0))
+        results_dict = getattr(metrics, "results_dict", {}) or {}
+
+        val_loss = _get_float_from_dict(
+            results_dict,
+            [
+                "val/box_loss",
+                "val/cls_loss",
+                "val/dfl_loss",
+                "metrics/box_loss",
+            ],
+            0.0,
+        )
+
+        # La forma más estable suele ser metrics.box.map50.
         map50 = float(metrics.box.map50)
-    except (AttributeError, TypeError):
-        val_loss, map50 = 0.0, 0.0
+
+    except Exception as exc:
+        print(f"[EVAL] WARNING: no se pudieron leer métricas de validación: {exc}")
+        val_loss = 0.0
+        map50 = 0.0
+
+    print(f"[EVAL] data={data_yaml} | loss={val_loss:.6f} | map50={map50:.6f}")
+
     return val_loss, map50
