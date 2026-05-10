@@ -27,7 +27,7 @@ def train(msg: Message, context: Context):
     data_yaml, num_train, _ = load_data(partition_id, num_partitions)
 
     # Entrenamos el modelo con los datos locales
-    model, train_loss = train_fn(
+    model, box_loss, cls_loss, dfl_loss = train_fn(
         model,
         data_yaml,
         context.run_config["local-epochs"],
@@ -35,10 +35,12 @@ def train(msg: Message, context: Context):
         device,
     )
 
-    # Enviamos de vuelta los pesos actualizados y la pérdida al servidor
+    # Enviamos de vuelta los pesos actualizados y las pérdidas al servidor
     model_record = ArrayRecord(model.model.state_dict())
     metrics = {
-        "train_loss": train_loss,
+        "train_box_loss": box_loss,
+        "train_cls_loss": cls_loss,
+        "train_dfl_loss": dfl_loss,
         "num-examples": num_train,  # necesario para que FedAvg pondere correctamente
     }
     metric_record = MetricRecord(metrics)
@@ -60,13 +62,20 @@ def evaluate(msg: Message, context: Context):
     num_partitions = context.node_config["num-partitions"]
     data_yaml, _, num_val = load_data(partition_id, num_partitions)
 
-    # Evaluamos el modelo y obtenemos la pérdida y el mAP50
-    eval_loss, map50 = test_fn(model, data_yaml, device)
+    # Evaluamos el modelo y obtenemos las métricas de detección
+    val_box_loss, val_cls_loss, val_dfl_loss, map50, map50_95, precision, recall = test_fn(
+        model, data_yaml, device
+    )
 
     # Devolvemos las métricas al servidor (sin pesos, solo resultados)
     metrics = {
-        "eval_loss": eval_loss,
+        "val_box_loss": val_box_loss,
+        "val_cls_loss": val_cls_loss,
+        "val_dfl_loss": val_dfl_loss,
         "map50": map50,
+        "map50_95": map50_95,
+        "precision": precision,
+        "recall": recall,
         "num-examples": num_val,
     }
     metric_record = MetricRecord(metrics)

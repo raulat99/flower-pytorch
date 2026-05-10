@@ -52,9 +52,19 @@ def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
     model.model.load_state_dict(arrays.to_torch_state_dict())
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # Cargamos el split de validación completo 
+    # Cargamos el split de validación completo
     data_yaml = load_centralized_dataset()
-    test_loss, map50 = test(model, data_yaml, device)
+    val_box_loss, val_cls_loss, val_dfl_loss, map50, map50_95, precision, recall = test(
+        model, data_yaml, device
+    )
 
-    # Devolvemos las métricas para que Flower las registre en los logs
-    return MetricRecord({"map50": map50, "loss": test_loss})
+    # Devolvemos todas las métricas de detección para que Flower las registre en los logs
+    return MetricRecord({
+        "map50": map50,
+        "map50_95": map50_95,
+        "precision": precision,
+        "recall": recall,
+        "val_box_loss": val_box_loss,
+        "val_cls_loss": val_cls_loss,
+        "val_dfl_loss": val_dfl_loss,
+    })
