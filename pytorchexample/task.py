@@ -574,13 +574,10 @@ def train(
     return net, box_loss, cls_loss, dfl_loss
 
 
-def test(net: YOLO, data_yaml: str, device: torch.device) -> tuple[float, float, float, float, float, float, float]:
+def test(net: YOLO, data_yaml: str, device: torch.device) -> tuple[float, float, float, float]:
     """Evalúa el modelo y devuelve métricas de detección.
 
     Devuelve:
-        - val/box_loss
-        - val/cls_loss
-        - val/dfl_loss
         - mAP50
         - mAP50-95
         - precision
@@ -601,18 +598,6 @@ def test(net: YOLO, data_yaml: str, device: torch.device) -> tuple[float, float,
     )
 
     try:
-        results_dict = getattr(metrics, "results_dict", {}) or {}
-
-        val_box_loss = _get_float_from_dict(
-            results_dict, ["val/box_loss", "metrics/box_loss"], 0.0
-        )
-        val_cls_loss = _get_float_from_dict(
-            results_dict, ["val/cls_loss", "metrics/cls_loss"], 0.0
-        )
-        val_dfl_loss = _get_float_from_dict(
-            results_dict, ["val/dfl_loss", "metrics/dfl_loss"], 0.0
-        )
-
         # metrics.box es la forma más estable en Ultralytics
         map50 = float(metrics.box.map50)
         map50_95 = float(metrics.box.map)
@@ -621,13 +606,11 @@ def test(net: YOLO, data_yaml: str, device: torch.device) -> tuple[float, float,
 
     except Exception as exc:
         print(f"[EVAL] WARNING: no se pudieron leer métricas de validación: {exc}")
-        val_box_loss = val_cls_loss = val_dfl_loss = 0.0
         map50 = map50_95 = precision = recall = 0.0
 
     print(
         f"[EVAL] data={data_yaml} | "
-        f"box_loss={val_box_loss:.4f} cls_loss={val_cls_loss:.4f} dfl_loss={val_dfl_loss:.4f} | "
         f"mAP50={map50:.4f} mAP50-95={map50_95:.4f} P={precision:.4f} R={recall:.4f}"
     )
 
-    return val_box_loss, val_cls_loss, val_dfl_loss, map50, map50_95, precision, recall
+    return map50, map50_95, precision, recall

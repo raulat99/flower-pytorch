@@ -1,6 +1,11 @@
 """pytorchexample: lógica del servidor federado para detección de matrículas."""
 
+import json
+import os
+
+import boto3
 import torch
+from datetime import datetime, timezone
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg
@@ -9,6 +14,29 @@ from pytorchexample.task import get_model, load_centralized_dataset, test
 
 # Creamos la aplicación servidor de Flower
 app = ServerApp()
+
+s3 = boto3.client("s3")
+
+BUCKET = os.environ["TFM_S3_BUCKET"]
+RUN_ID = os.environ.get(
+    "TFM_RUN_ID",
+    datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-yolov8n-flower"),
+)
+
+LAST_SERVER_METRICS: dict = {}
+
+
+def upload_json_to_s3(data: dict, key: str) -> None:
+    s3.put_object(
+        Bucket=BUCKET,
+        Key=key,
+        Body=json.dumps(data, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def upload_file_to_s3(local_path: str, key: str) -> None:
+    s3.upload_file(local_path, BUCKET, key)
 
 
 @app.main()
@@ -41,11 +69,30 @@ def main(grid: Grid, context: Context) -> None:
     # Al terminar guardamos el modelo global final en disco
     print("\nGuardando el modelo final en disco...")
     state_dict = result.arrays.to_torch_state_dict()
-    torch.save(state_dict, "final_model.pt")
+    model_path = "final_model.pt"
+    torch.save(state_dict, model_path)
+
+    model_key = f"runs/{RUN_ID}/models/final_model.pt"
+    summary_key = f"runs/{RUN_ID}/metrics/summary.json"
+
+    upload_file_to_s3(model_path, model_key)
+
+    summary = {
+        "run_id": RUN_ID,
+        "status": "completed",
+        "model": "yolov8n",
+        "dataset": "keremberke/license-plate-object-detection",
+        "model_s3_key": model_key,
+        "final_metrics": LAST_SERVER_METRICS,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    upload_json_to_s3(summary, summary_key)
 
 
 def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
     """Evalúa el modelo global después de cada ronda usando el dataset de validación centralizado."""
+    global LAST_SERVER_METRICS
 
     # Reconstruimos el modelo con los pesos agregados de esta ronda
     model = get_model()
@@ -54,8 +101,24 @@ def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
 
     # Cargamos el split de validación completo
     data_yaml = load_centralized_dataset()
-    val_box_loss, val_cls_loss, val_dfl_loss, map50, map50_95, precision, recall = test(
+    map50, map50_95, precision, recall = test(
         model, data_yaml, device
+    )
+
+    metrics = {
+        "round": server_round,
+        "map50": map50,
+        "map50_95": map50_95,
+        "precision": precision,
+        "recall": recall,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    LAST_SERVER_METRICS = metrics
+
+    upload_json_to_s3(
+        metrics,
+        f"runs/{RUN_ID}/metrics/round_{server_round:03d}.json",
     )
 
     # Devolvemos todas las métricas de detección para que Flower las registre en los logs
@@ -64,7 +127,4 @@ def global_evaluate(server_round: int, arrays: ArrayRecord) -> MetricRecord:
         "map50_95": map50_95,
         "precision": precision,
         "recall": recall,
-        "val_box_loss": val_box_loss,
-        "val_cls_loss": val_cls_loss,
-        "val_dfl_loss": val_dfl_loss,
     })

@@ -63,15 +63,12 @@ def evaluate(msg: Message, context: Context):
     data_yaml, _, num_val = load_data(partition_id, num_partitions)
 
     # Evaluamos el modelo y obtenemos las métricas de detección
-    val_box_loss, val_cls_loss, val_dfl_loss, map50, map50_95, precision, recall = test_fn(
+    map50, map50_95, precision, recall = test_fn(
         model, data_yaml, device
     )
 
     # Devolvemos las métricas al servidor (sin pesos, solo resultados)
     metrics = {
-        "val_box_loss": val_box_loss,
-        "val_cls_loss": val_cls_loss,
-        "val_dfl_loss": val_dfl_loss,
         "map50": map50,
         "map50_95": map50_95,
         "precision": precision,
