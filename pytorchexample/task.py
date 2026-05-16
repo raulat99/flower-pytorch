@@ -1,6 +1,7 @@
 """pytorchexample: aplicación Flower / PyTorch para detección federada de matrículas."""
 
 import copy
+import csv
 import os
 import shutil
 import tempfile
@@ -531,36 +532,44 @@ def train(
         exist_ok=True,
     )
 
-    train_loss = 0.0
+    box_loss = cls_loss = dfl_loss = 0.0
 
     try:
-        results_dict = getattr(results, "results_dict", {}) or {}
+        # Ultralytics siempre escribe results.csv con las pérdidas reales por época.
+        # Es la fuente más fiable independientemente de la versión.
+        csv_path = os.path.join(base_dir, "runs", "train", "results.csv")
 
-        # Algunas versiones de Ultralytics no guardan estas pérdidas en results_dict.
-        # Si no existen, devolvemos 0.0 solo como métrica auxiliar de Flower.
-        box_loss = _get_float_from_dict(
-            results_dict,
-            ["train/box_loss", "box_loss", "metrics/box_loss"],
-            0.0,
-        )
+        if os.path.exists(csv_path):
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
 
-        cls_loss = _get_float_from_dict(
-            results_dict,
-            ["train/cls_loss", "cls_loss", "metrics/cls_loss"],
-            0.0,
-        )
-
-        dfl_loss = _get_float_from_dict(
-            results_dict,
-            ["train/dfl_loss", "dfl_loss", "metrics/dfl_loss"],
-            0.0,
-        )
+            if rows:
+                # Normalizamos claves (Ultralytics añade espacios alrededor)
+                last = {k.strip(): v.strip() for k, v in rows[-1].items()}
+                box_loss = float(last.get("train/box_loss", 0.0) or 0.0)
+                cls_loss = float(last.get("train/cls_loss", 0.0) or 0.0)
+                dfl_loss = float(last.get("train/dfl_loss", 0.0) or 0.0)
+                print(
+                    f"[TRAIN] Época {last.get('epoch', '?')}: "
+                    f"box={box_loss:.4f} cls={cls_loss:.4f} dfl={dfl_loss:.4f}"
+                )
+        else:
+            # Fallback: leer del objeto results si el CSV no está disponible
+            results_dict = getattr(results, "results_dict", {}) or {}
+            box_loss = _get_float_from_dict(
+                results_dict, ["train/box_loss", "box_loss"], 0.0
+            )
+            cls_loss = _get_float_from_dict(
+                results_dict, ["train/cls_loss", "cls_loss"], 0.0
+            )
+            dfl_loss = _get_float_from_dict(
+                results_dict, ["train/dfl_loss", "dfl_loss"], 0.0
+            )
+            print("[TRAIN] WARNING: results.csv no encontrado, usando results_dict como fallback.")
 
     except Exception as exc:
         print(f"[TRAIN] WARNING: no se pudieron leer las pérdidas de entrenamiento: {exc}")
-        box_loss = 0.0
-        cls_loss = 0.0
-        dfl_loss = 0.0
+        box_loss = cls_loss = dfl_loss = 0.0
 
     return net, box_loss, cls_loss, dfl_loss
 
