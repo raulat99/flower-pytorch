@@ -66,7 +66,6 @@ def _extract_bboxes(example: dict[str, Any]) -> list[list[float]]:
     """Extrae bounding boxes del ejemplo de HuggingFace.
 
     El dataset está en formato COCO: [x_min, y_min, width, height].
-    Esta función es algo más robusta por si la estructura exacta cambia.
     """
     bboxes = []
 
@@ -124,7 +123,6 @@ def _extract_bboxes(example: dict[str, Any]) -> list[list[float]]:
 
 
 def _clear_yolo_output_dir(output_dir: str) -> None:
-    """Elimina un split YOLO temporal para regenerarlo limpio."""
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
 
@@ -193,7 +191,6 @@ def _save_examples_to_yolo(examples, output_dir: str) -> None:
                 box_w_norm = box_w / img_w
                 box_h_norm = box_h / img_h
 
-                # Clampeamos por seguridad al rango [0, 1]
                 x_center = max(0.0, min(1.0, x_center))
                 y_center = max(0.0, min(1.0, y_center))
                 box_w_norm = max(0.0, min(1.0, box_w_norm))
@@ -536,7 +533,6 @@ def train(
 
     try:
         # Ultralytics siempre escribe results.csv con las pérdidas reales por época.
-        # Es la fuente más fiable independientemente de la versión.
         csv_path = os.path.join(base_dir, "runs", "train", "results.csv")
 
         if os.path.exists(csv_path):
